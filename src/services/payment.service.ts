@@ -393,8 +393,8 @@ export async function initiatePayment(orderId: string): Promise<InitiatePaymentR
     notify_url: notifyUrl,
 
     order_id: order.id,
-    items: startupFee === "0.00" 
-      ? `${recurrenceDisplay} Subscription (${recurringAmount})` 
+    items: startupFee === "0.00"
+      ? `${recurrenceDisplay} Subscription (${recurringAmount})`
       : `Registration Fee (${startupFee}) + ${recurrenceDisplay} Subscription (${recurringAmount})`,
 
     currency,
@@ -897,7 +897,7 @@ export async function processPreapprovalNotify(rawPayload: Record<string, unknow
     if (paymentId) {
       console.log(`💸 Processing automatic refund for validation charge payment_id: ${paymentId}`);
       const refundSuccess = await refundPayherePayment(paymentId);
-      
+
       if (refundSuccess) {
         // Only send refund email when the refund was actually processed
         try {
@@ -929,15 +929,15 @@ export async function cancelPayhereSubscription(subscriptionId: string) {
   const appId = process.env.PAYHERE_APP_ID;
   const appSecret = process.env.PAYHERE_APP_SECRET;
   const checkoutUrl = getEnv("PAYHERE_CHECKOUT_URL");
-  
+
   if (!appId || !appSecret) {
     console.warn("⚠️ PAYHERE_APP_ID or PAYHERE_APP_SECRET not found in .env. Skipping PayHere API cancellation.");
     return false;
   }
 
   // derive base API url
-  const baseUrl = checkoutUrl.includes("sandbox") 
-    ? "https://sandbox.payhere.lk" 
+  const baseUrl = checkoutUrl.includes("sandbox")
+    ? "https://sandbox.payhere.lk"
     : "https://app.payhere.lk";
 
   try {
@@ -1005,8 +1005,8 @@ export async function refundPayherePayment(paymentId: string, description = "Car
   }
 
   // derive base API url
-  const baseUrl = checkoutUrl.includes("sandbox") 
-    ? "https://sandbox.payhere.lk" 
+  const baseUrl = checkoutUrl.includes("sandbox")
+    ? "https://sandbox.payhere.lk"
     : "https://app.payhere.lk";
 
   try {

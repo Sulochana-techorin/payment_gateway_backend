@@ -22,7 +22,7 @@ export async function createPayment(req: Request, res: Response) {
 export async function handlePayHereNotify(req: Request, res: Response) {
   const payload = req.body as Record<string, unknown>;
   const orderId = String(payload.order_id ?? "").trim();
-  
+
   console.log("📥 ====== RECEIVED PAYHERE WEBHOOK ======");
   console.log("📥 Full payload:", JSON.stringify(payload, null, 2));
   console.log("📥 order_id:", payload.order_id);
