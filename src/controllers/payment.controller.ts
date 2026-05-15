@@ -22,29 +22,35 @@ export async function createPayment(req: Request, res: Response) {
 export async function handlePayHereNotify(req: Request, res: Response) {
   const payload = req.body as Record<string, unknown>;
   const orderId = String(payload.order_id ?? "").trim();
-
+  
   console.log("📥 ====== RECEIVED PAYHERE WEBHOOK ======");
-  console.log("📥 Full payload:", JSON.stringify(payload, null, 2));
   console.log("📥 order_id:", payload.order_id);
+  console.log("📥 payment_id:", payload.payment_id);
+  console.log("📥 subscription_id:", payload.subscription_id);
   console.log("📥 status_code:", payload.status_code);
+  console.log("📥 payhere_amount:", payload.payhere_amount);
   console.log("📥 isCardUpdate:", orderId.startsWith("CARD_UPDATE_"));
   console.log("📥 ====== END WEBHOOK ======");
 
-  try {
-    if (orderId.startsWith("CARD_UPDATE_")) {
-      console.log("🔄 Processing as CARD_UPDATE preapproval...");
-      await processPreapprovalNotify(payload);
-    } else {
-      console.log("🔄 Processing as regular payment notify...");
-      await processPayHereNotify(payload);
-    }
-    console.log("✅ Successfully processed PayHere notify for:", orderId);
-  } catch (error) {
-    console.error("❌ Error processing PayHere notify:", error);
-    // We still return 200 to PayHere to stop retries, but we logged the error
-  }
-
+  // 🔥 CRITICAL: Respond 200 OK IMMEDIATELY so PayHere doesn't timeout/retry.
+  // All heavy processing (invoice, email, refund) happens in the background.
   res.status(200).send("OK");
+
+  // Process in background after responding
+  setImmediate(async () => {
+    try {
+      if (orderId.startsWith("CARD_UPDATE_")) {
+        console.log("🔄 Processing as CARD_UPDATE preapproval...");
+        await processPreapprovalNotify(payload);
+      } else {
+        console.log("🔄 Processing as regular payment notify...");
+        await processPayHereNotify(payload);
+      }
+      console.log("✅ Successfully processed PayHere notify for:", orderId);
+    } catch (error) {
+      console.error("❌ Error processing PayHere notify:", error);
+    }
+  });
 }
 
 export async function confirmPaymentFromReturn(req: Request, res: Response) {

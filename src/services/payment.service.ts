@@ -59,6 +59,9 @@ type InvoiceData = {
 
 const emailedSuccessOrders = new Set<string>();
 
+// Idempotency: track processed payment_ids to prevent duplicate webhook processing
+const processedPaymentIds = new Set<string>();
+
 type EmailTask = {
   invoiceData: InvoiceData;
   paymentId: string | null;
@@ -279,19 +282,26 @@ function getOrderAmounts(order: OrderRecord) {
 function determineChargeType(
   order: OrderRecord,
   payhereAmount: string,
-): "INITIAL" | "RENEWAL" | null {
-  const normalizedAmount = Number(payhereAmount).toFixed(2);
-  const { recurringAmount, firstChargeAmount } = getOrderAmounts(order);
-
-  if (normalizedAmount === firstChargeAmount) {
-    return "INITIAL";
-  }
-
-  if (normalizedAmount === recurringAmount) {
+  subscriptionId?: string,
+): "INITIAL" | "RENEWAL" {
+  // PRIMARY: If this order already has a stored subscription_id and it matches,
+  // this is a recurring renewal charge. PayHere sends the same subscription_id
+  // for all charges belonging to the same subscription.
+  const existingSubId = (order as any).payhere_subscription_id;
+  if (existingSubId && subscriptionId && existingSubId === subscriptionId) {
     return "RENEWAL";
   }
 
-  return null;
+  // SECONDARY: Use amount comparison as fallback
+  const normalizedAmount = Number(payhereAmount).toFixed(2);
+  const { recurringAmount, firstChargeAmount } = getOrderAmounts(order);
+
+  if (normalizedAmount === recurringAmount && order.status === "ACTIVE") {
+    return "RENEWAL";
+  }
+
+  // Default: treat as INITIAL (first payment or retry of first payment)
+  return "INITIAL";
 }
 
 async function ensureSubscriptionForOrder(
@@ -453,6 +463,16 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
     throw new ApiError(400, "Invalid md5sig");
   }
 
+  // 🔥 Idempotency: skip if we already processed this exact payment
+  if (payload.payment_id && processedPaymentIds.has(payload.payment_id)) {
+    console.log(`⚡ Skipping duplicate webhook for payment_id: ${payload.payment_id}`);
+    return {
+      orderId: payload.order_id,
+      status: "ALREADY_PROCESSED",
+      paymentId: payload.payment_id,
+    };
+  }
+
   const orderRepo = AppDataSource.getRepository<OrderRecord>(Order);
   const order = await orderRepo.findOneBy({ id: payload.order_id });
 
@@ -460,23 +480,10 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
     throw new ApiError(404, "Order not found");
   }
 
-  const chargeType = determineChargeType(order, payload.payhere_amount);
+  // 🔥 Use subscription_id as primary signal for INITIAL vs RENEWAL
+  const chargeType = determineChargeType(order, payload.payhere_amount, payload.subscription_id);
 
-  // In sandbox mode, PayHere may send slightly different amounts.
-  // Instead of rejecting, infer the charge type from order status.
-  const effectiveChargeType = chargeType ?? (order.status === "ACTIVE" ? "RENEWAL" : "INITIAL");
-
-  if (!chargeType) {
-    const { recurringAmount, firstChargeAmount } = getOrderAmounts(order);
-    console.warn(
-      `⚠️ Amount mismatch — received ${payload.payhere_amount}, expected first=${firstChargeAmount} or recurring=${recurringAmount}. ` +
-      `Inferring charge type as ${effectiveChargeType} based on order status=${order.status}`
-    );
-  }
-
-  if (effectiveChargeType === "RENEWAL" && order.status !== "ACTIVE") {
-    throw new ApiError(400, "Initial payment must include the registration fee");
-  }
+  console.log(`📊 Charge type: ${chargeType} | order.status: ${order.status} | amount: ${payload.payhere_amount} | subscription_id: ${payload.subscription_id ?? "N/A"}`);
 
   const statusCode = Number.parseInt(payload.status_code, 10);
 
@@ -499,10 +506,15 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
   const wasAlreadyActive = order.status === "ACTIVE";
   const updatedOrder = await updateOrderStatusById(order.id, nextStatus);
 
+  // Mark this payment as processed (after status update succeeds)
+  if (payload.payment_id) {
+    processedPaymentIds.add(payload.payment_id);
+  }
+
   // Only do invoice + subscription + email on a successful ACTIVE transition
   if (nextStatus !== "ACTIVE") {
     // If a renewal charge failed (card declined, no funds, etc.), email the user
-    if (nextStatus === "FAILED" && wasAlreadyActive && effectiveChargeType === "RENEWAL") {
+    if (nextStatus === "FAILED" && wasAlreadyActive && chargeType === "RENEWAL") {
       const userRepo = AppDataSource.getRepository<UserRecord>(User);
       const user = await userRepo.findOneBy({ id: order.user_id });
       if (user) {
@@ -534,29 +546,16 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
     };
   }
 
-  await ensureSubscriptionForOrder(updatedOrder as OrderRecord, effectiveChargeType);
+  await ensureSubscriptionForOrder(updatedOrder as OrderRecord, chargeType);
 
-  // Store PayHere subscription_id if provided
+  // Store PayHere subscription_id if provided (critical for future RENEWAL detection)
   if (payload.subscription_id) {
     const orderRepoForUpdate = AppDataSource.getRepository<OrderRecord>(Order);
     const orderToUpdate = await orderRepoForUpdate.findOneBy({ id: updatedOrder.id });
     if (orderToUpdate) {
       (orderToUpdate as any).payhere_subscription_id = payload.subscription_id;
       await orderRepoForUpdate.save(orderToUpdate);
-    }
-  }
-
-  // If this is a renewal (card update re-authorization), send card update email
-  if (effectiveChargeType === "RENEWAL" && wasAlreadyActive) {
-    const userRepo = AppDataSource.getRepository<UserRecord>(User);
-    const user = await userRepo.findOneBy({ id: order.user_id });
-    if (user) {
-      try {
-        await sendCardUpdateEmail(user.email, user.name, updatedOrder.id);
-        console.log("📧 Card update notification sent to", user.email);
-      } catch (err) {
-        console.error("❌ Failed to send card update email:", err);
-      }
+      console.log(`✅ Stored subscription_id: ${payload.subscription_id} for order: ${updatedOrder.id}`);
     }
   }
 
@@ -565,6 +564,7 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
   const invoicePath = await createInvoiceFile(invoiceData);
   await updateOrderInvoicePathById(updatedOrder.id, invoicePath);
 
+  // Send success email only on first activation (not on renewals or retries)
   if (!wasAlreadyActive && updatedOrder.status === "ACTIVE") {
     await trySendSuccessEmail(
       {
@@ -583,6 +583,7 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
   return {
     orderId: updatedOrder.id,
     status: updatedOrder.status,
+    chargeType,
     paymentId: payload.payment_id ?? null,
   };
 }
