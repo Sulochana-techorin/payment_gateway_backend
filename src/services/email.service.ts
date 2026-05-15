@@ -111,24 +111,15 @@ export async function sendEmail(
   text: string,
   attachments: Mail.Attachment[] = [],
 ) {
-  const fromAddress = getRequiredEnv("EMAIL_USER");
-  const transporter = getTransporter();
-
-  const info = await transporter.sendMail({
-    from: `"Payment App" <${fromAddress}>`,
-    to,
-    subject,
-    text,
-    attachments,
-  });
-
-  console.log("Email sent:", info.messageId, {
-    accepted: info.accepted,
-    rejected: info.rejected,
-    response: info.response,
-  });
-
-  return info;
+  // 🔇 TEMPORARILY DISABLED — Railway SMTP to Gmail is broken (IPv6/timeout)
+  // Remove this block to re-enable emails
+  console.log(`📧 [EMAIL DISABLED] Would send to: ${to} | Subject: ${subject}`);
+  return {
+    messageId: "disabled",
+    accepted: [to],
+    rejected: [],
+    response: "Email sending temporarily disabled",
+  };
 }
 
 export async function sendPaymentSuccessEmail(input: PaymentSuccessEmailInput) {
