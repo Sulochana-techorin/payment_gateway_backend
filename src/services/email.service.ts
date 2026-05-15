@@ -72,11 +72,16 @@ function getTransporter(): nodemailer.Transporter {
       user,
       pass,
     },
+    // Force IPv4 — Railway cannot reach Gmail via IPv6 (ENETUNREACH)
+    family: 4,
     // Prevent SMTP from hanging — fail fast
     connectionTimeout: 10000,  // 10s to establish TCP connection
     greetingTimeout: 10000,    // 10s for SMTP greeting
     socketTimeout: 15000,      // 15s for socket inactivity
-  });
+    tls: {
+      rejectUnauthorized: false,
+    },
+  } as any);
 }
 
 export async function verifyEmailTransport() {
