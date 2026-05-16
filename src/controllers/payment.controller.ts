@@ -10,6 +10,9 @@ import { InitiatePaymentPayload } from "../validators/payment.validator";
 import { requireBody } from "../validators/schema";
 import { getInvoiceData } from "../services/payment.service";
 import { generateInvoicePDF } from "../services/invoice.service";
+import { AppDataSource } from "../config/data-source";
+import { WebhookLog } from "../entity/webhook-log";
+import { WebhookLogRecord } from "../types/models";
 
 
 export async function createPayment(req: Request, res: Response) {
@@ -38,6 +41,9 @@ export async function handlePayHereNotify(req: Request, res: Response) {
 
   // Process in background after responding
   setImmediate(async () => {
+    let logError: string | null = null;
+    let logStack: string | null = null;
+
     try {
       if (orderId.startsWith("CARD_UPDATE_")) {
         console.log("🔄 Processing as CARD_UPDATE preapproval...");
@@ -49,6 +55,29 @@ export async function handlePayHereNotify(req: Request, res: Response) {
       console.log("✅ Successfully processed PayHere notify for:", orderId);
     } catch (error) {
       console.error("❌ Error processing PayHere notify:", error);
+      if (error instanceof Error) {
+        logError = error.message;
+        logStack = error.stack ?? null;
+      } else {
+        logError = String(error);
+      }
+    } finally {
+      // 📝 Log webhook to database
+      try {
+        const webhookLogRepo = AppDataSource.getRepository<WebhookLogRecord>(WebhookLog);
+        const logRecord = webhookLogRepo.create({
+          order_id: orderId || null,
+          payment_id: typeof payload.payment_id === "string" ? payload.payment_id : null,
+          status_code: typeof payload.status_code === "string" || typeof payload.status_code === "number" ? String(payload.status_code) : null,
+          payload: payload,
+          error_message: logError,
+          stack_trace: logStack,
+        });
+        await webhookLogRepo.save(logRecord);
+        console.log("📝 Webhook payload logged to database");
+      } catch (logErr) {
+        console.error("❌ Failed to log webhook to DB:", logErr);
+      }
     }
   });
 }

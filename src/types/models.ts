@@ -29,3 +29,23 @@ export interface SubscriptionRecord {
   end_date: Date;
   status: string;
 }
+
+export interface ProcessedWebhookRecord {
+  id: number;
+  payment_id: string;
+  order_id: string;
+  status_code: string;
+  charge_type: string;
+  processed_at: Date;
+}
+
+export interface WebhookLogRecord {
+  id: number;
+  order_id?: string | null;
+  payment_id?: string | null;
+  status_code?: string | null;
+  payload: Record<string, unknown>;
+  error_message?: string | null;
+  stack_trace?: string | null;
+  created_at?: Date;
+}

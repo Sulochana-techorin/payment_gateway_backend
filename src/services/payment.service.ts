@@ -6,8 +6,9 @@ import { AppDataSource } from "../config/data-source";
 import { Order } from "../entity/order";
 import { Subscription } from "../entity/subscription";
 import { User } from "../entity/user";
+import { ProcessedWebhook } from "../entity/processed-webhook";
 import { ApiError } from "../middleware/errorHandler";
-import { OrderRecord, SubscriptionRecord, UserRecord } from "../types/models";
+import { OrderRecord, SubscriptionRecord, UserRecord, ProcessedWebhookRecord } from "../types/models";
 import { updateOrderInvoicePathById, updateOrderStatusById } from "./order.service";
 import { createInvoiceFile } from "./invoice.service";
 import { sendPaymentSuccessEmail, sendCardUpdateEmail, sendPaymentFailedEmail, sendRefundSuccessEmail } from "./email.service";
@@ -59,8 +60,105 @@ type InvoiceData = {
 
 const emailedSuccessOrders = new Set<string>();
 
-// Idempotency: track processed payment_ids to prevent duplicate webhook processing
-const processedPaymentIds = new Set<string>();
+// Idempotency: in-memory cache (L1) + database (L2) for processed payment_ids.
+// The in-memory Set is a fast cache to avoid DB hits within the same server session.
+// The DB table is the source of truth and survives restarts/redeployments.
+const processedPaymentIdsCache = new Set<string>();
+
+// Per-order mutex to serialize concurrent processing (webhook vs return URL).
+// Prevents two async paths from processing the same order simultaneously.
+const orderLocks = new Map<string, Promise<void>>();
+
+/**
+ * Acquire a per-order lock. Returns a release function.
+ * Ensures that only one async operation processes a given order at a time.
+ */
+function acquireOrderLock(orderId: string): Promise<() => void> {
+  const existingLock = orderLocks.get(orderId) ?? Promise.resolve();
+
+  let releaseFn: () => void;
+  const newLock = new Promise<void>((resolve) => {
+    releaseFn = () => {
+      orderLocks.delete(orderId);
+      resolve();
+    };
+  });
+
+  orderLocks.set(orderId, newLock);
+
+  return existingLock.then(() => releaseFn!);
+}
+
+/**
+ * Atomically claim a payment_id for processing.
+ * Uses INSERT with unique constraint as a database-level lock.
+ *
+ * Returns true if THIS caller claimed it (proceed with processing).
+ * Returns false if another process already claimed it (skip processing).
+ *
+ * This eliminates the TOCTOU race between check-then-act:
+ * - Old pattern: check if exists → (gap where race happens) → insert
+ * - New pattern: try insert → success = you own it, failure = someone else does
+ */
+async function claimPaymentForProcessing(
+  paymentId: string,
+  orderId: string,
+  statusCode: string,
+  chargeType: string,
+): Promise<boolean> {
+  // L1: fast in-memory check (safe because once added, never removed)
+  if (processedPaymentIdsCache.has(paymentId)) {
+    return false;
+  }
+
+  // L2: atomic INSERT — whoever succeeds first owns the processing
+  const webhookRepo = AppDataSource.getRepository<ProcessedWebhookRecord>(ProcessedWebhook);
+
+  try {
+    const record = webhookRepo.create({
+      payment_id: paymentId,
+      order_id: orderId,
+      status_code: statusCode,
+      charge_type: chargeType,
+    });
+    await webhookRepo.save(record);
+    processedPaymentIdsCache.add(paymentId);
+    console.log(`🔒 Payment ${paymentId} claimed for processing (charge: ${chargeType})`);
+    return true; // We own it — proceed with processing
+  } catch (error: any) {
+    if (error?.code === '23505') {
+      // Unique constraint violation — another process already claimed it
+      console.log(`⚡ Payment ${paymentId} already claimed by another process`);
+      processedPaymentIdsCache.add(paymentId);
+      return false; // Skip — someone else is handling it
+    }
+    // Unexpected DB error — log but allow processing to continue
+    // (better to risk a duplicate than to silently drop a payment)
+    console.error(`❌ Failed to claim payment ${paymentId}:`, error);
+    return true;
+  }
+}
+
+/**
+ * Check if a payment_id has already been processed (read-only check).
+ * Used by the fallback path to see if the webhook already handled things.
+ */
+async function isPaymentAlreadyProcessed(paymentId: string): Promise<boolean> {
+  if (processedPaymentIdsCache.has(paymentId)) {
+    return true;
+  }
+
+  const webhookRepo = AppDataSource.getRepository<ProcessedWebhookRecord>(ProcessedWebhook);
+  const existing = await webhookRepo.findOneBy({ payment_id: paymentId });
+
+  if (existing) {
+    processedPaymentIdsCache.add(paymentId);
+    return true;
+  }
+
+  return false;
+}
+
 
 type EmailTask = {
   invoiceData: InvoiceData;
@@ -284,15 +382,25 @@ function determineChargeType(
   payhereAmount: string,
   subscriptionId?: string,
 ): "INITIAL" | "RENEWAL" {
-  // PRIMARY: If this order already has a stored subscription_id and it matches,
-  // this is a recurring renewal charge. PayHere sends the same subscription_id
-  // for all charges belonging to the same subscription.
+  // PRIMARY: If this order already has a stored subscription_id and the
+  // incoming webhook carries a subscription_id, this is a recurring charge.
+  // PayHere sends the same subscription_id for all charges belonging to the
+  // same subscription.
   const existingSubId = (order as any).payhere_subscription_id;
   if (existingSubId && subscriptionId && existingSubId === subscriptionId) {
     return "RENEWAL";
   }
 
-  // SECONDARY: Use amount comparison as fallback
+  // SECONDARY: If the order is already ACTIVE and PayHere sends a
+  // subscription_id (even if we haven't stored it yet or it was overwritten
+  // by a card update), treat it as a RENEWAL.
+  if (order.status === "ACTIVE" && subscriptionId) {
+    return "RENEWAL";
+  }
+
+  // TERTIARY: Use amount comparison as fallback —
+  // If the charged amount matches the recurring amount (not the first-time
+  // total that includes the startup fee), it must be a renewal.
   const normalizedAmount = Number(payhereAmount).toFixed(2);
   const { recurringAmount, firstChargeAmount } = getOrderAmounts(order);
 
@@ -302,6 +410,15 @@ function determineChargeType(
 
   // Default: treat as INITIAL (first payment or retry of first payment)
   return "INITIAL";
+}
+
+function toSafeDate(value: unknown): Date {
+  if (value instanceof Date) return value;
+  if (typeof value === "string" || typeof value === "number") {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return new Date(); // fallback to now
 }
 
 async function ensureSubscriptionForOrder(
@@ -333,16 +450,25 @@ async function ensureSubscriptionForOrder(
     return existing;
   }
 
-  // Renewal payments should extend from the current end date when the
-  // subscription is still active, otherwise start a fresh period from now.
+  // RENEWAL: extend from the current end_date when the subscription hasn't
+  // expired yet, otherwise start a fresh period from the charge time.
+  // NOTE: TypeORM may return timestamp columns as strings from PostgreSQL,
+  // so we must parse them safely before comparing.
+  const currentEndDate = toSafeDate(existing.end_date);
+
   const renewalStartDate =
-    existing.end_date instanceof Date && existing.end_date > chargedAt
-      ? existing.end_date
+    currentEndDate.getTime() > chargedAt.getTime()
+      ? currentEndDate
       : chargedAt;
 
-  existing.start_date = chargedAt;
+  //existing.start_date = chargedAt;
   existing.end_date = addDays(renewalStartDate, durationDays);
   existing.status = "ACTIVE";
+
+  console.log(`🔄 RENEWAL: extending subscription for order ${order.id}`);
+  console.log(`   Previous end_date: ${currentEndDate.toISOString()}`);
+  console.log(`   New start_date: ${chargedAt.toISOString()}`);
+  console.log(`   New end_date: ${existing.end_date.toISOString()}`);
 
   return subscriptionRepo.save(existing);
 }
@@ -463,129 +589,163 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
     throw new ApiError(400, "Invalid md5sig");
   }
 
-  // 🔥 Idempotency: skip if we already processed this exact payment
-  if (payload.payment_id && processedPaymentIds.has(payload.payment_id)) {
-    console.log(`⚡ Skipping duplicate webhook for payment_id: ${payload.payment_id}`);
-    return {
-      orderId: payload.order_id,
-      status: "ALREADY_PROCESSED",
-      paymentId: payload.payment_id,
-    };
-  }
+  // 🔒 Acquire per-order lock to prevent webhook vs return URL race
+  const releaseLock = await acquireOrderLock(payload.order_id);
 
-  const orderRepo = AppDataSource.getRepository<OrderRecord>(Order);
-  const order = await orderRepo.findOneBy({ id: payload.order_id });
+  try {
+    // 🔥 Atomic idempotency: try to claim this payment_id FIRST.
+    // If another process (webhook retry or return URL) already claimed it, skip.
+    if (payload.payment_id) {
+      // We need the order and charge type for the claim record,
+      // so do a quick pre-check before the full claim.
+      const alreadyDone = await isPaymentAlreadyProcessed(payload.payment_id);
+      if (alreadyDone) {
+        console.log(`⚡ Skipping duplicate webhook for payment_id: ${payload.payment_id} (DB-verified)`);
+        return {
+          orderId: payload.order_id,
+          status: "ALREADY_PROCESSED",
+          paymentId: payload.payment_id,
+        };
+      }
+    }
 
-  if (!order) {
-    throw new ApiError(404, "Order not found");
-  }
+    const orderRepo = AppDataSource.getRepository<OrderRecord>(Order);
+    const order = await orderRepo.findOneBy({ id: payload.order_id });
 
-  // 🔥 Use subscription_id as primary signal for INITIAL vs RENEWAL
-  const chargeType = determineChargeType(order, payload.payhere_amount, payload.subscription_id);
+    if (!order) {
+      throw new ApiError(404, "Order not found");
+    }
 
-  console.log(`📊 Charge type: ${chargeType} | order.status: ${order.status} | amount: ${payload.payhere_amount} | subscription_id: ${payload.subscription_id ?? "N/A"}`);
+    // 🔥 Use subscription_id as primary signal for INITIAL vs RENEWAL
+    const chargeType = determineChargeType(order, payload.payhere_amount, payload.subscription_id);
 
-  const statusCode = Number.parseInt(payload.status_code, 10);
+    console.log(`📊 Charge type: ${chargeType} | order.status: ${order.status} | amount: ${payload.payhere_amount} | subscription_id: ${payload.subscription_id ?? "N/A"}`);
 
-  if (Number.isNaN(statusCode)) {
-    throw new ApiError(400, "Invalid status_code");
-  }
+    const statusCode = Number.parseInt(payload.status_code, 10);
 
-  const nextStatus = mapPayHereStatus(statusCode);
+    if (Number.isNaN(statusCode)) {
+      throw new ApiError(400, "Invalid status_code");
+    }
 
-  // Unknown code — do nothing
-  if (!nextStatus) {
-    return {
-      orderId: order.id,
-      status: order.status,
-      paymentId: payload.payment_id ?? null,
-    };
-  }
+    const nextStatus = mapPayHereStatus(statusCode);
 
-  // Persist the new status (ACTIVE, FAILED, CANCELLED, PENDING, etc.)
-  const wasAlreadyActive = order.status === "ACTIVE";
-  const updatedOrder = await updateOrderStatusById(order.id, nextStatus);
+    // Unknown code — do nothing
+    if (!nextStatus) {
+      return {
+        orderId: order.id,
+        status: order.status,
+        paymentId: payload.payment_id ?? null,
+      };
+    }
 
-  // Mark this payment as processed (after status update succeeds)
-  if (payload.payment_id) {
-    processedPaymentIds.add(payload.payment_id);
-  }
+    // 🔥 Atomic claim: INSERT into processed_webhooks. If unique violation,
+    // another process beat us — skip all processing.
+    if (payload.payment_id) {
+      const claimed = await claimPaymentForProcessing(
+        payload.payment_id,
+        order.id,
+        payload.status_code,
+        chargeType,
+      );
+      if (!claimed) {
+        console.log(`⚡ Payment ${payload.payment_id} already claimed, skipping`);
+        return {
+          orderId: order.id,
+          status: "ALREADY_PROCESSED",
+          paymentId: payload.payment_id,
+        };
+      }
+    }
 
-  // Only do invoice + subscription + email on a successful ACTIVE transition
-  if (nextStatus !== "ACTIVE") {
-    // If a renewal charge failed (card declined, no funds, etc.), email the user
-    if (nextStatus === "FAILED" && wasAlreadyActive && chargeType === "RENEWAL") {
-      const userRepo = AppDataSource.getRepository<UserRecord>(User);
-      const user = await userRepo.findOneBy({ id: order.user_id });
-      if (user) {
-        try {
-          const frontendUrl = getEnv("FRONTEND_BASE_URL").replace(/\/+$/, "");
-          const cardUpdateUrl = `${frontendUrl}/dashboard`;
-          const currency = getEnv("CURRENCY");
-          const amount = Number(order.subscription_amount).toFixed(2);
+    // Persist the new status (ACTIVE, FAILED, CANCELLED, PENDING, etc.)
+    const wasAlreadyActive = order.status === "ACTIVE";
+    const updatedOrder = await updateOrderStatusById(order.id, nextStatus);
 
-          await sendPaymentFailedEmail(
-            user.email,
-            user.name,
-            order.id,
-            amount,
-            currency,
-            cardUpdateUrl,
-          );
-          console.log("📧 Payment failed notification sent to", user.email);
-        } catch (err) {
-          console.error("❌ Failed to send payment failed email:", err);
+    // Only do invoice + subscription + email on a successful ACTIVE transition
+    if (nextStatus !== "ACTIVE") {
+      // If a renewal charge failed (card declined, no funds, etc.), email the user
+      if (nextStatus === "FAILED" && wasAlreadyActive && chargeType === "RENEWAL") {
+        const userRepo = AppDataSource.getRepository<UserRecord>(User);
+        const user = await userRepo.findOneBy({ id: order.user_id });
+        if (user) {
+          try {
+            const frontendUrl = getEnv("FRONTEND_BASE_URL").replace(/\/+$/, "");
+            const cardUpdateUrl = `${frontendUrl}/dashboard`;
+            const currency = getEnv("CURRENCY");
+            const amount = Number(order.subscription_amount).toFixed(2);
+
+            await sendPaymentFailedEmail(
+              user.email,
+              user.name,
+              order.id,
+              amount,
+              currency,
+              cardUpdateUrl,
+            );
+            console.log("📧 Payment failed notification sent to", user.email);
+          } catch (err) {
+            console.error("❌ Failed to send payment failed email:", err);
+          }
         }
       }
+
+      return {
+        orderId: updatedOrder.id,
+        status: updatedOrder.status,
+        paymentId: payload.payment_id ?? null,
+      };
+    }
+
+    await ensureSubscriptionForOrder(updatedOrder as OrderRecord, chargeType);
+
+    // Store PayHere subscription_id if provided (critical for future RENEWAL detection).
+    // Only store if the order doesn't already have one, or if this is the first payment.
+    // Card updates use a separate field (customer_token) and should NOT overwrite this.
+    if (payload.subscription_id) {
+      const orderRepoForUpdate = AppDataSource.getRepository<OrderRecord>(Order);
+      const orderToUpdate = await orderRepoForUpdate.findOneBy({ id: updatedOrder.id });
+      if (orderToUpdate) {
+        const existingSubId = (orderToUpdate as any).payhere_subscription_id;
+        if (!existingSubId || chargeType === "INITIAL") {
+          (orderToUpdate as any).payhere_subscription_id = payload.subscription_id;
+          await orderRepoForUpdate.save(orderToUpdate);
+          console.log(`✅ Stored subscription_id: ${payload.subscription_id} for order: ${updatedOrder.id}`);
+        } else {
+          console.log(`ℹ️ subscription_id already set (${existingSubId}), skipping overwrite for order: ${updatedOrder.id}`);
+        }
+      }
+    }
+
+    // Generate invoice file after successful activation.
+    const invoiceData = await getInvoiceData(updatedOrder.id);
+    const invoicePath = await createInvoiceFile(invoiceData);
+    await updateOrderInvoicePathById(updatedOrder.id, invoicePath);
+
+    // Send success email only on first activation (not on renewals or retries)
+    if (!wasAlreadyActive && updatedOrder.status === "ACTIVE") {
+      await trySendSuccessEmail(
+        {
+          ...invoiceData,
+          order: {
+            ...invoiceData.order,
+            status: updatedOrder.status,
+            invoice_path: invoicePath,
+          },
+        },
+        payload.payment_id ?? null,
+        invoicePath,
+      );
     }
 
     return {
       orderId: updatedOrder.id,
       status: updatedOrder.status,
+      chargeType,
       paymentId: payload.payment_id ?? null,
     };
+  } finally {
+    releaseLock();
   }
-
-  await ensureSubscriptionForOrder(updatedOrder as OrderRecord, chargeType);
-
-  // Store PayHere subscription_id if provided (critical for future RENEWAL detection)
-  if (payload.subscription_id) {
-    const orderRepoForUpdate = AppDataSource.getRepository<OrderRecord>(Order);
-    const orderToUpdate = await orderRepoForUpdate.findOneBy({ id: updatedOrder.id });
-    if (orderToUpdate) {
-      (orderToUpdate as any).payhere_subscription_id = payload.subscription_id;
-      await orderRepoForUpdate.save(orderToUpdate);
-      console.log(`✅ Stored subscription_id: ${payload.subscription_id} for order: ${updatedOrder.id}`);
-    }
-  }
-
-  // Generate invoice file after successful activation.
-  const invoiceData = await getInvoiceData(updatedOrder.id);
-  const invoicePath = await createInvoiceFile(invoiceData);
-  await updateOrderInvoicePathById(updatedOrder.id, invoicePath);
-
-  // Send success email only on first activation (not on renewals or retries)
-  if (!wasAlreadyActive && updatedOrder.status === "ACTIVE") {
-    await trySendSuccessEmail(
-      {
-        ...invoiceData,
-        order: {
-          ...invoiceData.order,
-          status: updatedOrder.status,
-          invoice_path: invoicePath,
-        },
-      },
-      payload.payment_id ?? null,
-      invoicePath,
-    );
-  }
-
-  return {
-    orderId: updatedOrder.id,
-    status: updatedOrder.status,
-    chargeType,
-    paymentId: payload.payment_id ?? null,
-  };
 }
 
 
@@ -593,48 +753,98 @@ export async function confirmPaymentSuccessByOrderId(
   orderId: string,
   paymentId: string | null = null
 ) {
-  console.log("✅ Manual payment success triggered:", orderId);
+  console.log("✅ Manual/return payment success triggered:", orderId);
 
-  const orderRepo = AppDataSource.getRepository<OrderRecord>(Order);
+  // 🔒 Acquire per-order lock to prevent race with webhook handler
+  const releaseLock = await acquireOrderLock(orderId);
 
-  const order = await orderRepo.findOneBy({ id: orderId });
+  try {
+    const orderRepo = AppDataSource.getRepository<OrderRecord>(Order);
 
-  if (!order) {
-    throw new ApiError(404, "Order not found");
+    const order = await orderRepo.findOneBy({ id: orderId });
+
+    if (!order) {
+      throw new ApiError(404, "Order not found");
+    }
+
+    // 🔥 Atomic idempotency: if paymentId is provided, try to claim it.
+    // If the webhook already claimed it, skip all processing.
+    if (paymentId) {
+      const alreadyProcessed = await isPaymentAlreadyProcessed(paymentId);
+      if (alreadyProcessed) {
+        console.log(`⚡ Payment ${paymentId} already processed by webhook, skipping fallback`);
+        return {
+          orderId: order.id,
+          status: order.status,
+          emailSent: false,
+          skippedReason: "ALREADY_PROCESSED_BY_WEBHOOK",
+        };
+      }
+    }
+
+    // Determine charge type based on current order state.
+    // If the order is already ACTIVE, this is a renewal or duplicate.
+    const wasAlreadyActive = order.status === "ACTIVE";
+    const chargeType = wasAlreadyActive ? "RENEWAL" : "INITIAL";
+
+    console.log(`📊 Fallback charge type: ${chargeType} | order.status: ${order.status}`);
+
+    // Atomic claim — if the webhook is processing concurrently, this will fail
+    if (paymentId) {
+      const claimed = await claimPaymentForProcessing(paymentId, order.id, "2", chargeType);
+      if (!claimed) {
+        console.log(`⚡ Payment ${paymentId} already claimed, skipping fallback`);
+        return {
+          orderId: order.id,
+          status: order.status,
+          emailSent: false,
+          skippedReason: "CLAIMED_BY_WEBHOOK",
+        };
+      }
+    }
+
+    // Update status to ACTIVE
+    const updated = await updateOrderStatusById(order.id, "ACTIVE");
+
+    // ✅ Subscription — pass the correct chargeType so renewals extend dates
+    await ensureSubscriptionForOrder(updated as OrderRecord, chargeType);
+
+    // ✅ Invoice
+    const invoiceData = await getInvoiceData(updated.id);
+    const invoicePath = await createInvoiceFile(invoiceData);
+
+    await updateOrderInvoicePathById(updated.id, invoicePath);
+
+    // Send success email only on first activation (not on renewals)
+    let emailSent = false;
+    if (!wasAlreadyActive) {
+      emailSent = await trySendSuccessEmail(
+        {
+          ...invoiceData,
+          order: {
+            ...invoiceData.order,
+            status: updated.status,
+            invoice_path: invoicePath,
+          },
+        },
+        paymentId,
+        invoicePath,
+      );
+    } else {
+      console.log("🔄 Skipping email for renewal/duplicate in fallback path");
+    }
+
+    return {
+      orderId: updated.id,
+      status: updated.status,
+      chargeType,
+      emailSent,
+    };
+  } finally {
+    releaseLock();
   }
-
-  // ✅ Force ACTIVE (safe for sandbox)
-  const updated = await updateOrderStatusById(order.id, "ACTIVE");
-
-  // ✅ Subscription
-  await ensureSubscriptionForOrder(updated as OrderRecord);
-
-  // ✅ Invoice
-  const invoiceData = await getInvoiceData(updated.id);
-  const invoicePath = await createInvoiceFile(invoiceData);
-
-  await updateOrderInvoicePathById(updated.id, invoicePath);
-
-  // 🔥 ALWAYS send email
-  const emailSent = await trySendSuccessEmail(
-    {
-      ...invoiceData,
-      order: {
-        ...invoiceData.order,
-        status: updated.status,
-        invoice_path: invoicePath,
-      },
-    },
-    paymentId,
-    invoicePath,
-  );
-
-  return {
-    orderId: updated.id,
-    status: updated.status,
-    emailSent,
-  };
 }
+
 
 
 export async function getInvoiceData(orderId: string) {
@@ -853,12 +1063,15 @@ export async function processPreapprovalNotify(rawPayload: Record<string, unknow
     return { success: false, message: "No matching order" };
   }
 
-  // Store the customer token
+  // Store the customer token.
+  // IMPORTANT: Do NOT overwrite payhere_subscription_id — that field is used
+  // for RENEWAL detection and must keep the original PayHere subscription ID.
+  // The customer_token from card preapproval is a different value.
   if (customerToken) {
-    (matchingOrder as any).payhere_subscription_id = customerToken;
     (matchingOrder as any).card_updated_at = new Date();
     await orderRepo.save(matchingOrder);
     console.log("✅ Customer token and update date stored for order:", matchingOrder.id);
+    console.log(`ℹ️ customer_token: ${customerToken} (NOT overwriting payhere_subscription_id: ${(matchingOrder as any).payhere_subscription_id})`);
 
     // Save the real user update time and date persistently
     try {
