@@ -5,7 +5,8 @@ import { AppDataSource } from "../config/data-source";
 import { Order } from "../entity/order";
 import { User } from "../entity/user";
 import { Subscription } from "../entity/subscription";
-import { OrderRecord, UserRecord, SubscriptionRecord } from "../types/models";
+import { OrderRecord, UserRecord, SubscriptionRecord, ProcessedWebhookRecord } from "../types/models";
+import { ProcessedWebhook } from "../entity/processed-webhook";
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
@@ -122,6 +123,7 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
   const userRepo = AppDataSource.getRepository<UserRecord>(User);
   const orderRepo = AppDataSource.getRepository<OrderRecord>(Order);
   const subRepo = AppDataSource.getRepository<SubscriptionRecord>(Subscription);
+  const webhookRepo = AppDataSource.getRepository<ProcessedWebhookRecord>(ProcessedWebhook);
 
   let userId = parseInt(req.params.userId as string, 10);
 
@@ -149,6 +151,14 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
     where: { user_id: userId } as AnyWhere,
     order: { id: "DESC" } as AnyWhere,
   });
+
+  const orderIds = orders.map((o) => o.id);
+  const webhooks = orderIds.length > 0
+    ? await webhookRepo.find({
+        where: { order_id: In(orderIds) } as AnyWhere,
+        order: { processed_at: "DESC" } as AnyWhere,
+      })
+    : [];
 
   // Fetch latest subscription record for this user
   const subscriptions = await subRepo.find({
@@ -281,6 +291,17 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
       };
     }
 
+    const orderWebhooks = webhooks
+      .filter((wh) => wh.order_id === order.id)
+      .map((wh) => ({
+        payment_id: wh.payment_id,
+        status_code: wh.status_code,
+        charge_type: wh.charge_type,
+        amount: wh.charge_type === "INITIAL" ? Number(order.total_amount).toFixed(2) : Number(order.subscription_amount).toFixed(2),
+        currency: order.currency,
+        date: wh.processed_at,
+      }));
+
     return {
       orderId: order.id,
       totalAmount: Number(order.total_amount),
@@ -295,6 +316,7 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
       emailTracking,
       cardTracking,
       livePayhereAppDetails: matchedLive ?? { status: "Sandbox Mock / Local Record", info: "Verified Local DB state" },
+      charges: orderWebhooks,
     };
   });
 
