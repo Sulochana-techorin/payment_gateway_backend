@@ -230,15 +230,11 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
       ? livePayhereData.find((ls: AnyWhere) => ls.order_id === order.id || ls.subscription_id === order.payhere_subscription_id)
       : null;
 
-    // Next payment date & time resolution
-    let nextPaymentDate = "N/A";
-    let nextPaymentDateTime = "N/A";
+    // Next payment date & time resolution (as ISO string or raw date)
+    let nextPaymentDateTime: any = "N/A";
     if (currentSub?.end_date) {
-      const d = new Date(currentSub.end_date);
-      nextPaymentDate = d.toLocaleDateString();
-      nextPaymentDateTime = `${d.toLocaleDateString()} ${d.toLocaleTimeString()}`;
+      nextPaymentDateTime = currentSub.end_date; // Pass raw ISO string/Date
     } else if (matchedLive?.next_payment_date) {
-      nextPaymentDate = matchedLive.next_payment_date;
       nextPaymentDateTime = matchedLive.next_payment_date;
     }
 
@@ -248,7 +244,7 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
     // Track email delivery status for failures
     const emailTracking = isFailed ? {
       sent: true,
-      sentAt: new Date().toLocaleString(),
+      sentAt: new Date(),
       status: "Delivered (Failure Alert Sent)",
       recipient: user.email,
     } : {
@@ -282,7 +278,7 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
       cardTracking = {
         updated: true,
         token: activeToken,
-        updatedAt: realTimestampLog?.updatedAt || (order.card_updated_at ? new Date(order.card_updated_at).toLocaleString() : "Verified via Preapproval Linkage"),
+        updatedAt: realTimestampLog?.updatedAt || order.card_updated_at || new Date(),
         method: activeToken.startsWith("TEST_") ? "Simulated Assured Token" : "Stored Payment Card",
         status: "Active Assured",
       };
@@ -301,7 +297,7 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
         id: `order-${order.id}`,
         orderId: order.id,
         paymentId: "N/A",
-        date: order.card_updated_at ? new Date(order.card_updated_at).toLocaleString() : new Date().toLocaleString(),
+        date: order.card_updated_at ? order.card_updated_at : new Date(),
         type: "INITIAL",
         totalAmount: Number(order.total_amount),
         subscriptionAmount: Number(order.subscription_amount),
@@ -309,7 +305,6 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
         currency: order.currency,
         status: order.status,
         invoicePath: order.invoice_path,
-        nextPaymentDate,
         nextPaymentDateTime,
         isFailed,
         emailTracking,
@@ -326,7 +321,7 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
           id: `webhook-${wh.id}`,
           orderId: order.id,
           paymentId: wh.payment_id,
-          date: new Date(wh.processed_at).toLocaleString(),
+          date: wh.processed_at,
           type: wh.charge_type, // INITIAL or RENEWAL
           totalAmount: wh.charge_type === "INITIAL" ? Number(order.total_amount) : Number(order.subscription_amount),
           subscriptionAmount: Number(order.subscription_amount),
@@ -334,7 +329,6 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
           currency: order.currency,
           status: statusStr,
           invoicePath: order.invoice_path,
-          nextPaymentDate,
           nextPaymentDateTime,
           isFailed: isWhFailed,
           emailTracking,
