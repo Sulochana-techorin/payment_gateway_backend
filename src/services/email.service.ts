@@ -1,5 +1,4 @@
-import nodemailer from "nodemailer";
-import type Mail from "nodemailer/lib/mailer";
+import * as brevo from "@getbrevo/brevo";
 
 import { ApiError } from "../middleware/errorHandler";
 
@@ -38,66 +37,30 @@ function getOptionalEnv(name: string): string | undefined {
   return value.trim();
 }
 
-function parsePort(value: string): number {
-  const port = Number.parseInt(value, 10);
-
-  if (Number.isNaN(port) || port <= 0) {
-    throw new ApiError(500, "EMAIL_PORT must be a positive integer");
-  }
-
-  return port;
+interface SendSmtpEmailAttachment {
+  content: string;  // Base64 encoded content
+  name: string;
 }
 
-function parseSecure(value: string | undefined): boolean {
-  if (!value) {
-    return false;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  return normalized === "1" || normalized === "true" || normalized === "yes";
-}
-
-function getTransporter(): nodemailer.Transporter {
-  const host = getRequiredEnv("EMAIL_HOST");
-  const port = parsePort(getRequiredEnv("EMAIL_PORT"));
-  const user = getRequiredEnv("EMAIL_USER");
-  const pass = getRequiredEnv("EMAIL_PASS");
-  const secure = parseSecure(getOptionalEnv("EMAIL_SECURE"));
-
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth: {
-      user,
-      pass,
-    },
-    // Force IPv4 — Railway cannot reach Gmail via IPv6 (ENETUNREACH)
-    family: 4,
-    // Prevent SMTP from hanging — fail fast
-    connectionTimeout: 10000,  // 10s to establish TCP connection
-    greetingTimeout: 10000,    // 10s for SMTP greeting
-    socketTimeout: 15000,      // 15s for socket inactivity
-    tls: {
-      rejectUnauthorized: false,
-    },
-  } as any);
+function getBrevoClient(): brevo.TransactionalEmailsApi {
+  const apiKey = getRequiredEnv("BREVO_API_KEY");
+  
+  const client = new brevo.TransactionalEmailsApi();
+  client.setApiKey(brevo.TransactionalEmailsApiApiKeys.apiKey, apiKey);
+  
+  return client;
 }
 
 export async function verifyEmailTransport() {
-  const host = getRequiredEnv("EMAIL_HOST");
-  const port = parsePort(getRequiredEnv("EMAIL_PORT"));
-  const secure = parseSecure(getOptionalEnv("EMAIL_SECURE"));
-  const user = getRequiredEnv("EMAIL_USER");
-
-  const transporter = getTransporter();
-  await transporter.verify();
+  const apiKey = getRequiredEnv("BREVO_API_KEY");
+  const senderEmail = getRequiredEnv("BREVO_SENDER_EMAIL");
+  const senderName = getRequiredEnv("BREVO_SENDER_NAME");
 
   return {
-    host,
-    port,
-    secure,
-    user,
+    service: "Brevo",
+    senderEmail,
+    senderName,
+    apiKeyConfigured: apiKey.length > 0,
   };
 }
 
@@ -109,28 +72,61 @@ export async function sendEmail(
   to: string,
   subject: string,
   text: string,
-  attachments: Mail.Attachment[] = [],
+  attachments: SendSmtpEmailAttachment[] = [],
 ) {
-  // 🔇 TEMPORARILY DISABLED — Railway SMTP to Gmail is broken (IPv6/timeout)
-  // Remove this block to re-enable emails
-  console.log(`📧 [EMAIL DISABLED] Would send to: ${to} | Subject: ${subject}`);
-  return {
-    messageId: "disabled",
-    accepted: [to],
-    rejected: [],
-    response: "Email sending temporarily disabled",
-  };
+  try {
+    const client = getBrevoClient();
+    const senderEmail = getRequiredEnv("BREVO_SENDER_EMAIL");
+    const senderName = getRequiredEnv("BREVO_SENDER_NAME");
+
+    const sendSmtpEmail = new brevo.SendSmtpEmail();
+    sendSmtpEmail.to = [{ email: to }];
+    sendSmtpEmail.sender = { name: senderName, email: senderEmail };
+    sendSmtpEmail.subject = subject;
+    sendSmtpEmail.textContent = text;
+    
+    // Add attachments if provided
+    if (attachments.length > 0) {
+      sendSmtpEmail.attachment = attachments.map(a => ({
+        name: a.name,
+        content: a.content,  // Already base64 encoded from sendPaymentSuccessEmail
+      }));
+    }
+
+    const response = await client.sendTransacEmail(sendSmtpEmail);
+    
+    console.log(`📧 [EMAIL SENT] to: ${to} | Subject: ${subject} | Message ID: ${response.body.messageId}`);
+    
+    return {
+      messageId: response.body.messageId,
+      accepted: [to],
+      rejected: [],
+      response: "Email sent successfully via Brevo",
+    };
+  } catch (error: any) {
+    console.error("❌ [EMAIL ERROR]", {
+      to,
+      subject,
+      error: error.message,
+    });
+    throw new ApiError(500, `Failed to send email: ${error.message}`);
+  }
 }
 
 export async function sendPaymentSuccessEmail(input: PaymentSuccessEmailInput) {
-  const attachments: Mail.Attachment[] = [];
+  const attachments: SendSmtpEmailAttachment[] = [];
 
   if (input.invoicePath) {
-    attachments.push({
-      filename: `invoice-${input.orderId}.pdf`,
-      path: input.invoicePath,
-      contentType: "application/pdf",
-    });
+    try {
+      const fs = await import("fs").then(m => m.promises);
+      const fileContent = await fs.readFile(input.invoicePath);
+      attachments.push({
+        content: fileContent.toString("base64"),  // Convert Buffer to base64 string
+        name: `invoice-${input.orderId}.pdf`,
+      });
+    } catch (error) {
+      console.warn(`Failed to attach invoice: ${error}`);
+    }
   }
 
   const text = [
@@ -257,3 +253,5 @@ export async function sendRefundSuccessEmail(
     text,
   );
 }
+
+
