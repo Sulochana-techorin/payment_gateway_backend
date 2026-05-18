@@ -221,8 +221,10 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
     }
   }
 
-  // Construct rich tracking structure per order/subscription
-  const trackingRecords = orders.map((order) => {
+  // Construct rich flat tracking structure per individual payment/charge
+  const trackingRecords: any[] = [];
+
+  for (const order of orders) {
     // Check if this specific order matches a live subscription from PayHere app
     const matchedLive = Array.isArray(livePayhereData)
       ? livePayhereData.find((ls: AnyWhere) => ls.order_id === order.id || ls.subscription_id === order.payhere_subscription_id)
@@ -291,34 +293,57 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
       };
     }
 
-    const orderWebhooks = webhooks
-      .filter((wh) => wh.order_id === order.id)
-      .map((wh) => ({
-        payment_id: wh.payment_id,
-        status_code: wh.status_code,
-        charge_type: wh.charge_type,
-        amount: wh.charge_type === "INITIAL" ? Number(order.total_amount).toFixed(2) : Number(order.subscription_amount).toFixed(2),
-        currency: order.currency,
-        date: wh.processed_at,
-      }));
+    const orderWebhooks = webhooks.filter((wh) => wh.order_id === order.id);
 
-    return {
-      orderId: order.id,
-      totalAmount: Number(order.total_amount),
-      subscriptionAmount: Number(order.subscription_amount),
-      basePrice: Number(order.base_price),
-      currency: order.currency,
-      status: order.status,
-      invoicePath: order.invoice_path,
-      nextPaymentDate,
-      nextPaymentDateTime,
-      isFailed,
-      emailTracking,
-      cardTracking,
-      livePayhereAppDetails: matchedLive ?? { status: "Sandbox Mock / Local Record", info: "Verified Local DB state" },
-      charges: orderWebhooks,
-    };
-  });
+    if (orderWebhooks.length === 0) {
+      // Push initial record if no webhook has been received yet
+      trackingRecords.push({
+        id: `order-${order.id}`,
+        orderId: order.id,
+        paymentId: "N/A",
+        date: order.card_updated_at ? new Date(order.card_updated_at).toLocaleString() : new Date().toLocaleString(),
+        type: "INITIAL",
+        totalAmount: Number(order.total_amount),
+        subscriptionAmount: Number(order.subscription_amount),
+        basePrice: Number(order.base_price),
+        currency: order.currency,
+        status: order.status,
+        invoicePath: order.invoice_path,
+        nextPaymentDate,
+        nextPaymentDateTime,
+        isFailed,
+        emailTracking,
+        cardTracking,
+        livePayhereAppDetails: matchedLive ?? { status: "Sandbox Mock / Local Record", info: "Verified Local DB state" },
+      });
+    } else {
+      // Push a separate tracking row for every single processed webhook payment!
+      orderWebhooks.forEach((wh) => {
+        const isWhFailed = wh.status_code !== "2";
+        const statusStr = isWhFailed ? "FAILED" : "ACTIVE";
+
+        trackingRecords.push({
+          id: `webhook-${wh.id}`,
+          orderId: order.id,
+          paymentId: wh.payment_id,
+          date: new Date(wh.processed_at).toLocaleString(),
+          type: wh.charge_type, // INITIAL or RENEWAL
+          totalAmount: wh.charge_type === "INITIAL" ? Number(order.total_amount) : Number(order.subscription_amount),
+          subscriptionAmount: Number(order.subscription_amount),
+          basePrice: Number(order.base_price),
+          currency: order.currency,
+          status: statusStr,
+          invoicePath: order.invoice_path,
+          nextPaymentDate,
+          nextPaymentDateTime,
+          isFailed: isWhFailed,
+          emailTracking,
+          cardTracking,
+          livePayhereAppDetails: matchedLive ?? { status: "Sandbox Mock / Local Record", info: "Verified Local DB state" },
+        });
+      });
+    }
+  }
 
   const { password: _pw, ...safeUser } = user;
 
