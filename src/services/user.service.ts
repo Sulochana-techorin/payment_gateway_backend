@@ -2,9 +2,11 @@ import { AppDataSource } from "../config/data-source";
 import { User } from "../entity/user";
 import { Order } from "../entity/order";
 import { Subscription } from "../entity/subscription";
-import { UserRecord, OrderRecord, SubscriptionRecord } from "../types/models";
+import { ProcessedWebhook } from "../entity/processed-webhook";
+import { UserRecord, OrderRecord, SubscriptionRecord, ProcessedWebhookRecord } from "../types/models";
 import { ApiError } from "../middleware/errorHandler";
 import { UpdateProfilePayload } from "../validators/user.validator";
+import { In } from "typeorm";
 
 export async function getUserProfile(userId: number) {
   const userRepo = AppDataSource.getRepository<UserRecord>(User);
@@ -53,6 +55,7 @@ export async function updateUserProfile(userId: number, payload: UpdateProfilePa
 export async function getUserSubscription(userId: number) {
   const orderRepo = AppDataSource.getRepository<OrderRecord>(Order);
   const subscriptionRepo = AppDataSource.getRepository<SubscriptionRecord>(Subscription);
+  const webhookRepo = AppDataSource.getRepository<ProcessedWebhookRecord>(ProcessedWebhook);
 
   // Find the user's most recent ACTIVE order
   const orders = await orderRepo.find({
@@ -61,8 +64,36 @@ export async function getUserSubscription(userId: number) {
   });
 
   if (!orders || orders.length === 0) {
-    return { hasSubscription: false, order: null, subscription: null };
+    return { hasSubscription: false, order: null, subscription: null, paymentHistory: [] };
   }
+
+  const orderIds = orders.map((o) => o.id);
+  const webhooks = await webhookRepo.find({
+    where: { order_id: In(orderIds), status_code: "2" },
+    order: { processed_at: "DESC" } as any,
+  });
+
+  const paymentHistory = webhooks.map((wh) => {
+    const relatedOrder = orders.find((o) => o.id === wh.order_id);
+    let amount = "0.00";
+    let currency = "LKR";
+    if (relatedOrder) {
+      currency = relatedOrder.currency;
+      amount =
+        wh.charge_type === "INITIAL"
+          ? Number(relatedOrder.total_amount).toFixed(2)
+          : Number(relatedOrder.subscription_amount).toFixed(2);
+    }
+    return {
+      id: wh.id,
+      payment_id: wh.payment_id,
+      order_id: wh.order_id,
+      charge_type: wh.charge_type,
+      amount,
+      currency,
+      date: wh.processed_at,
+    };
+  });
 
   // Find the active order first, otherwise fallback to latest
   const activeOrder = orders.find((o) => o.status === "ACTIVE") || orders[0];
@@ -90,5 +121,6 @@ export async function getUserSubscription(userId: number) {
           end_date: subscription.end_date,
         }
       : null,
+    paymentHistory,
   };
 }
