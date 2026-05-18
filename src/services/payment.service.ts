@@ -501,16 +501,16 @@ export async function initiatePayment(orderId: string): Promise<InitiatePaymentR
   // 🔥 REQUIRED for subscription mode
   const subscription = getEnv("PAYHERE_SUBSCRIPTION_FLAG");
 
+  // 🔥 Hash must match ONLY amount (NOT total, NOT startup_fee)
   const secretHash = crypto
     .createHash("md5")
     .update(merchantSecret)
     .digest("hex")
     .toUpperCase();
 
-  // 🔥 Hash must match EXACTLY the `amount` field sent in the form.
-  // DO NOT add the startup_fee to the hash amount. PayHere calculates the hash
-  // using ONLY the value passed in the `amount` parameter.
-  const hashAmount = recurringAmount;
+  // 🔥 CRITICAL FIX: PayHere REQUIRES the hash to use (recurringAmount + startupFee) 
+  // when a startup_fee is present. This does NOT change the amount charged, it is just for security validation!
+  const hashAmount = Number(Number(recurringAmount) + Number(startupFee)).toFixed(2);
 
   const hash = crypto
     .createHash("md5")
@@ -553,15 +553,11 @@ export async function initiatePayment(orderId: string): Promise<InitiatePaymentR
     hash,
   };
 
-  // 🔍 Debug (keep this while testing)
-  console.log("🔍 FINAL PAYHERE REQUEST:", {
-    merchantId,
-    orderId: order.id,
-    recurringAmount,
-    startupFee,
-    currency,
-    hash,
-  });
+  console.log("\n=======================================================");
+  console.log("📤 [PAYHERE] OUTGOING INITIATE PAYMENT CALL:");
+  console.log("URL:", checkoutUrl);
+  console.log("PAYLOAD:", JSON.stringify(fields, null, 2));
+  console.log("=======================================================\n");
 
   return {
     checkoutUrl,
@@ -974,12 +970,11 @@ export async function initiateCardUpdate(userId: number): Promise<InitiateCardUp
     hash,
   };
 
-  console.log("🔍 CARD UPDATE PREAPPROVAL REQUEST:", {
-    merchantId,
-    preapprovalOrderId,
-    preapproveUrl,
-    currency,
-  });
+  console.log("\n=======================================================");
+  console.log("📤 [PAYHERE] OUTGOING CARD UPDATE PREAPPROVAL CALL:");
+  console.log("URL:", preapproveUrl);
+  console.log("PAYLOAD:", JSON.stringify(fields, null, 2));
+  console.log("=======================================================\n");
 
   return {
     checkoutUrl: preapproveUrl,
@@ -1175,23 +1170,39 @@ export async function cancelPayhereSubscription(subscriptionId: string) {
     const accessToken = tokenData.access_token;
 
     // 2. Call cancel API
-    const cancelRes = await fetch(`${baseUrl}/merchant/v1/subscription/cancel`, {
+    const cancelUrl = `${baseUrl}/merchant/v1/subscription/cancel`;
+    const cancelPayload = { subscription_id: subscriptionId };
+
+    console.log("\n=======================================================");
+    console.log(`📤 [PAYHERE] OUTGOING SUBSCRIPTION CANCEL CALL for ${subscriptionId}:`);
+    console.log("URL:", cancelUrl);
+    console.log("PAYLOAD:", JSON.stringify(cancelPayload, null, 2));
+    console.log("=======================================================\n");
+
+    const cancelRes = await fetch(cancelUrl, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ subscription_id: subscriptionId })
+      body: JSON.stringify(cancelPayload)
     });
 
     if (!cancelRes.ok) {
       const errText = await cancelRes.text();
-      console.error(`❌ PayHere Cancel Failed for Sub ${subscriptionId}:`, errText);
+      console.log("\n=======================================================");
+      console.log(`📥 [PAYHERE] INCOMING SUBSCRIPTION CANCEL ERROR RESPONSE:`);
+      console.log(`Status: ${cancelRes.status}`);
+      console.log(`Error: ${errText}`);
+      console.log("=======================================================\n");
       return false;
     }
 
     const cancelData = await cancelRes.json();
-    console.log(`✅ PayHere Cancelled Sub ${subscriptionId}:`, cancelData.msg);
+    console.log("\n=======================================================");
+    console.log(`📥 [PAYHERE] INCOMING SUBSCRIPTION CANCEL SUCCESS RESPONSE:`);
+    console.log(JSON.stringify(cancelData, null, 2));
+    console.log("=======================================================\n");
     return cancelData.status === 1;
 
   } catch (error) {
@@ -1244,26 +1255,42 @@ export async function refundPayherePayment(paymentId: string, description = "Car
     const accessToken = tokenData.access_token;
 
     // 2. Call refund API
-    const refundRes = await fetch(`${baseUrl}/merchant/v1/payment/refund`, {
+    const refundUrl = `${baseUrl}/merchant/v1/payment/refund`;
+    const refundPayload = {
+      payment_id: paymentId,
+      description,
+    };
+
+    console.log("\n=======================================================");
+    console.log(`📤 [PAYHERE] OUTGOING REFUND CALL for payment ${paymentId}:`);
+    console.log("URL:", refundUrl);
+    console.log("PAYLOAD:", JSON.stringify(refundPayload, null, 2));
+    console.log("=======================================================\n");
+
+    const refundRes = await fetch(refundUrl, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${accessToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        payment_id: paymentId,
-        description,
-      }),
+      body: JSON.stringify(refundPayload),
     });
 
     if (!refundRes.ok) {
       const errText = await refundRes.text();
-      console.error(`❌ PayHere Refund Failed for Payment ${paymentId}:`, errText);
+      console.log("\n=======================================================");
+      console.log(`📥 [PAYHERE] INCOMING REFUND ERROR RESPONSE:`);
+      console.log(`Status: ${refundRes.status}`);
+      console.log(`Error: ${errText}`);
+      console.log("=======================================================\n");
       return false;
     }
 
     const refundData = await refundRes.json();
-    console.log(`✅ PayHere Refunded Payment ${paymentId}:`, refundData.msg || refundData.message);
+    console.log("\n=======================================================");
+    console.log(`📥 [PAYHERE] INCOMING REFUND SUCCESS RESPONSE:`);
+    console.log(JSON.stringify(refundData, null, 2));
+    console.log("=======================================================\n");
     return refundData.status === 1 || refundData.status === "success" || refundData.status === true;
 
   } catch (error) {

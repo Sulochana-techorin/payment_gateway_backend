@@ -26,14 +26,11 @@ export async function handlePayHereNotify(req: Request, res: Response) {
   const payload = req.body as Record<string, unknown>;
   const orderId = String(payload.order_id ?? "").trim();
   
-  console.log("📥 ====== RECEIVED PAYHERE WEBHOOK ======");
-  console.log("📥 order_id:", payload.order_id);
-  console.log("📥 payment_id:", payload.payment_id);
-  console.log("📥 subscription_id:", payload.subscription_id);
-  console.log("📥 status_code:", payload.status_code);
-  console.log("📥 payhere_amount:", payload.payhere_amount);
-  console.log("📥 isCardUpdate:", orderId.startsWith("CARD_UPDATE_"));
-  console.log("📥 ====== END WEBHOOK ======");
+  console.log("\n=======================================================");
+  console.log("📥 [PAYHERE] INCOMING WEBHOOK NOTIFICATION (CALLBACK):");
+  console.log("URL: /api/payment/notify");
+  console.log("PAYLOAD:", JSON.stringify(payload, null, 2));
+  console.log("=======================================================\n");
 
   // 🔥 CRITICAL: Respond 200 OK IMMEDIATELY so PayHere doesn't timeout/retry.
   // All heavy processing (invoice, email, refund) happens in the background.
