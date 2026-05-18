@@ -501,16 +501,16 @@ export async function initiatePayment(orderId: string): Promise<InitiatePaymentR
   // 🔥 REQUIRED for subscription mode
   const subscription = getEnv("PAYHERE_SUBSCRIPTION_FLAG");
 
-  // 🔥 Hash must match ONLY amount (NOT total, NOT startup_fee)
   const secretHash = crypto
     .createHash("md5")
     .update(merchantSecret)
     .digest("hex")
     .toUpperCase();
 
-  // 🔥 CRITICAL FIX: PayHere REQUIRES the hash to use (recurringAmount + startupFee) 
-  // when a startup_fee is present. This does NOT change the amount charged, it is just for security validation!
-  const hashAmount = Number(Number(recurringAmount) + Number(startupFee)).toFixed(2);
+  // 🔥 Hash must match EXACTLY the `amount` field sent in the form.
+  // DO NOT add the startup_fee to the hash amount. PayHere calculates the hash
+  // using ONLY the value passed in the `amount` parameter.
+  const hashAmount = recurringAmount;
 
   const hash = crypto
     .createHash("md5")
