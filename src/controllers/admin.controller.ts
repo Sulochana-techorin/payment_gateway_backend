@@ -29,58 +29,92 @@ function parsePagination(query: Record<string, string | undefined>) {
 export async function getAllPayments(req: Request, res: Response) {
   const orderRepo = AppDataSource.getRepository<OrderRecord>(Order);
   const userRepo = AppDataSource.getRepository<UserRecord>(User);
+  const webhookRepo = AppDataSource.getRepository<ProcessedWebhookRecord>(ProcessedWebhook);
 
   const query = req.query as Record<string, string | undefined>;
   const { status, search } = query;
   const { page, limit, skip } = parsePagination(query);
 
-  const qb = orderRepo
-    .createQueryBuilder("o")
-    .skip(skip)
-    .take(limit)
-    .orderBy("o.user_id", "DESC");
+  // Fetch all orders, webhooks and users for in-memory mapping
+  const orders = await orderRepo.find();
+  const webhooks = await webhookRepo.find();
+  const users = await userRepo.find();
 
-  // ── Status filter (case-insensitive via UPPER) ─────────────
-  const statusVal = status?.trim().toUpperCase();
-  if (statusVal && statusVal !== "ALL") {
-    qb.andWhere("UPPER(o.status) = :status", { status: statusVal });
-  }
+  const userMap = new Map(users.map((u) => [u.id, u]));
 
-  // ── Search: find matching user ids first ───────────────────
-  const q = search?.trim() ?? "";
-  if (q) {
-    const matchedUsers = await userRepo.find({
-      where: [
-        { name: ILike(`%${q}%`) } as AnyWhere,
-        { email: ILike(`%${q}%`) } as AnyWhere,
-      ],
-      select: ["id"] as AnyWhere,
-    });
-    const matchedUserIds = matchedUsers.map((u) => u.id);
+  const allPayments: any[] = [];
 
-    if (matchedUserIds.length > 0) {
-      qb.andWhere(
-        "(CAST(o.id AS TEXT) ILIKE :q OR o.user_id IN (:...uids))",
-        { q: `%${q}%`, uids: matchedUserIds },
-      );
+  for (const order of orders) {
+    const user = userMap.get(order.user_id);
+    const userName = user?.name ?? "Unknown";
+    const userEmail = user?.email ?? "Unknown";
+
+    const orderWebhooks = webhooks.filter((wh) => wh.order_id === order.id);
+
+    if (orderWebhooks.length === 0) {
+      allPayments.push({
+        id: `order-${order.id}`,
+        orderId: order.id,
+        paymentId: "N/A",
+        user_id: order.user_id,
+        userName,
+        userEmail,
+        user_count: order.user_count,
+        total_amount: Number(order.total_amount),
+        currency: order.currency,
+        status: order.status,
+        charge_type: "INITIAL",
+        date: order.card_updated_at ? order.card_updated_at : new Date(),
+        invoice_path: order.invoice_path,
+      });
     } else {
-      qb.andWhere("CAST(o.id AS TEXT) ILIKE :q", { q: `%${q}%` });
+      orderWebhooks.forEach((wh) => {
+        const isWhFailed = wh.status_code !== "2";
+        const statusStr = isWhFailed ? "FAILED" : "ACTIVE";
+
+        allPayments.push({
+          id: `webhook-${wh.id}`,
+          orderId: order.id,
+          paymentId: wh.payment_id,
+          user_id: order.user_id,
+          userName,
+          userEmail,
+          user_count: order.user_count,
+          total_amount: wh.charge_type === "INITIAL" ? Number(order.total_amount) : Number(order.subscription_amount),
+          currency: order.currency,
+          status: statusStr,
+          charge_type: wh.charge_type, // INITIAL or RENEWAL
+          date: wh.processed_at,
+          invoice_path: order.invoice_path,
+        });
+      });
     }
   }
 
-  const [orders, total] = await qb.getManyAndCount();
+  // ── 1. Filter by Status ────────────────────────────────────
+  let filtered = allPayments;
+  const statusVal = status?.trim().toUpperCase();
+  if (statusVal && statusVal !== "ALL") {
+    filtered = filtered.filter((p) => p.status.toUpperCase() === statusVal);
+  }
 
-  // ── Enrich with user data ──────────────────────────────────
-  const uniqueUserIds = [...new Set(orders.map((o) => o.user_id))];
-  const users = uniqueUserIds.length > 0
-    ? await userRepo.find({ where: { id: In(uniqueUserIds) } as AnyWhere })
-    : [];
-  const userMap = new Map(users.map((u) => [u.id, u]));
+  // ── 2. Filter by Search ────────────────────────────────────
+  const q = search?.trim().toLowerCase() ?? "";
+  if (q) {
+    filtered = filtered.filter((p) =>
+      p.userName.toLowerCase().includes(q) ||
+      p.userEmail.toLowerCase().includes(q) ||
+      p.orderId.toLowerCase().includes(q) ||
+      p.paymentId.toLowerCase().includes(q)
+    );
+  }
 
-  const data = orders.map((order) => {
-    const user = userMap.get(order.user_id);
-    return { ...order, userName: user?.name ?? "Unknown", userEmail: user?.email ?? "Unknown" };
-  });
+  // ── 3. Sort by Date (latest first) ─────────────────────────
+  filtered.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+  // ── 4. Paginate ────────────────────────────────────────────
+  const total = filtered.length;
+  const data = filtered.slice(skip, skip + limit);
 
   res.json({ data, total, page, limit, totalPages: Math.ceil(total / limit) || 1 });
 }
