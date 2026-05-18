@@ -70,7 +70,9 @@ export async function getAllPayments(req: Request, res: Response) {
     } else {
       orderWebhooks.forEach((wh) => {
         const isWhFailed = wh.status_code !== "2";
-        const statusStr = isWhFailed ? "FAILED" : "ACTIVE";
+        // INITIAL charge type reflects the current active subscription state (ACTIVE, CANCELLED, etc.),
+        // whereas RENEWAL charge types represent past transaction success (ACTIVE or FAILED).
+        const statusStr = wh.charge_type === "INITIAL" ? order.status : (isWhFailed ? "FAILED" : "ACTIVE");
 
         allPayments.push({
           id: `webhook-${wh.id}`,
@@ -349,7 +351,7 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
       // Push a separate tracking row for every single processed webhook payment!
       orderWebhooks.forEach((wh) => {
         const isWhFailed = wh.status_code !== "2";
-        const statusStr = isWhFailed ? "FAILED" : "ACTIVE";
+        const statusStr = wh.charge_type === "INITIAL" ? order.status : (isWhFailed ? "FAILED" : "ACTIVE");
 
         trackingRecords.push({
           id: `webhook-${wh.id}`,
