@@ -7,6 +7,7 @@ import { User } from "../entity/user";
 import { Subscription } from "../entity/subscription";
 import { OrderRecord, UserRecord, SubscriptionRecord, ProcessedWebhookRecord } from "../types/models";
 import { ProcessedWebhook } from "../entity/processed-webhook";
+import { cancelPayhereSubscription } from "../services/payment.service";
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
@@ -64,7 +65,7 @@ export async function getAllPayments(req: Request, res: Response) {
         currency: order.currency,
         status: order.status,
         charge_type: "INITIAL",
-        date: order.card_updated_at ? order.card_updated_at : new Date(),
+        date: order.created_at ? order.created_at : (order.card_updated_at ? order.card_updated_at : new Date()),
         invoice_path: order.invoice_path,
       });
     } else {
@@ -162,10 +163,11 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
   const webhookRepo = AppDataSource.getRepository<ProcessedWebhookRecord>(ProcessedWebhook);
 
   let userId = parseInt(req.params.userId as string, 10);
+  const queriedOrderId = req.query.orderId ? String(req.query.orderId).trim() : null;
 
   // If orderId was passed (admin panel passes userId=0 with orderId query), resolve the user
-  if (req.query.orderId) {
-    const order = await orderRepo.findOneBy({ id: String(req.query.orderId).trim() });
+  if (queriedOrderId) {
+    const order = await orderRepo.findOneBy({ id: queriedOrderId });
     if (order) {
       userId = order.user_id;
     }
@@ -182,25 +184,37 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
     return;
   }
 
-  // Fetch all orders for this user
-  const orders = await orderRepo.find({
-    where: { user_id: userId } as AnyWhere,
-    order: { id: "DESC" } as AnyWhere,
-  });
+  // When orderId is provided (Payments tab click), only fetch that specific order.
+  // When only userId is provided (Users tab click), fetch ALL orders for the user.
+  let orders: OrderRecord[];
+  if (queriedOrderId) {
+    const singleOrder = await orderRepo.findOneBy({ id: queriedOrderId });
+    orders = singleOrder ? [singleOrder] : [];
+  } else {
+    orders = await orderRepo.find({
+      where: { user_id: userId } as AnyWhere,
+      order: { id: "DESC" } as AnyWhere,
+    });
+  }
 
   const orderIds = orders.map((o) => o.id);
   const webhooks = orderIds.length > 0
     ? await webhookRepo.find({
-        where: { order_id: In(orderIds) } as AnyWhere,
-        order: { processed_at: "DESC" } as AnyWhere,
-      })
+      where: { order_id: In(orderIds) } as AnyWhere,
+      order: { processed_at: "DESC" } as AnyWhere,
+    })
     : [];
 
-  // Fetch latest subscription record for this user
-  const subscriptions = await subRepo.find({
-    where: { user_id: userId } as AnyWhere,
-    order: { start_date: "DESC" } as AnyWhere,
-  });
+  // Fetch subscription records scoped to the fetched orders
+  const subscriptions = queriedOrderId
+    ? await subRepo.find({
+      where: { order_id: queriedOrderId } as AnyWhere,
+      order: { start_date: "DESC" } as AnyWhere,
+    })
+    : await subRepo.find({
+      where: { user_id: userId } as AnyWhere,
+      order: { start_date: "DESC" } as AnyWhere,
+    });
   const currentSub = subscriptions[0] ?? null;
 
   // Live query to PayHere app API (with timeout to prevent hanging in sandbox)
@@ -240,12 +254,12 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
         if (subRes.ok) {
           const subData = await subRes.json();
           const list = Array.isArray(subData) ? subData : subData.data || [];
-          
+
           // Filter matching live subscriptions
           const orderIds = orders.map((o) => o.id);
           const subIds = orders.map((o) => o.payhere_subscription_id).filter(Boolean);
 
-          const matchedLiveSubs = list.filter((ls: AnyWhere) => 
+          const matchedLiveSubs = list.filter((ls: AnyWhere) =>
             orderIds.includes(ls.order_id) || subIds.includes(ls.subscription_id || ls.id)
           );
 
@@ -266,16 +280,19 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
       ? livePayhereData.find((ls: AnyWhere) => ls.order_id === order.id || ls.subscription_id === order.payhere_subscription_id)
       : null;
 
+    // Find the subscription associated with this specific order
+    const orderSub = subscriptions.find((s) => s.order_id === order.id) ?? null;
+
     // Next payment date & time resolution (as ISO string or raw date)
     let nextPaymentDateTime: any = "N/A";
-    if (currentSub?.end_date) {
-      nextPaymentDateTime = currentSub.end_date; // Pass raw ISO string/Date
+    if (orderSub?.end_date) {
+      nextPaymentDateTime = orderSub.end_date; // Pass raw ISO string/Date
     } else if (matchedLive?.next_payment_date) {
       nextPaymentDateTime = matchedLive.next_payment_date;
     }
 
     // Determine failure notification state
-    const isFailed = order.status === "FAILED" || currentSub?.status === "FAILED" || String(matchedLive?.status).toUpperCase() === "FAILED";
+    const isFailed = order.status === "FAILED" || orderSub?.status === "FAILED" || String(matchedLive?.status).toUpperCase() === "FAILED";
 
     // Track email delivery status for failures
     const emailTracking = isFailed ? {
@@ -333,7 +350,7 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
         id: `order-${order.id}`,
         orderId: order.id,
         paymentId: "N/A",
-        date: order.card_updated_at ? order.card_updated_at : new Date(),
+        date: order.created_at ? order.created_at : (order.card_updated_at ? order.card_updated_at : new Date()),
         type: "INITIAL",
         totalAmount: Number(order.total_amount),
         subscriptionAmount: Number(order.subscription_amount),
@@ -388,5 +405,50 @@ export async function getUserTrackingDetails(req: Request, res: Response) {
       hasFailedPayments: trackingRecords.some((t) => t.isFailed),
       latestNextPaymentDate: trackingRecords[0]?.nextPaymentDateTime ?? "N/A",
     },
+  });
+}
+
+export async function adminCancelSubscription(req: Request, res: Response) {
+  const payload = req.body as Record<string, unknown>;
+  const orderId = typeof payload.orderId === "string" ? payload.orderId : "";
+
+  if (!orderId.trim()) {
+    res.status(400).json({ message: "orderId is required" });
+    return;
+  }
+
+  const orderRepo = AppDataSource.getRepository<OrderRecord>(Order);
+  const subscriptionRepo = AppDataSource.getRepository<SubscriptionRecord>(Subscription);
+
+  const order = await orderRepo.findOneBy({ id: orderId });
+  if (!order) {
+    res.status(404).json({ message: "Order not found" });
+    return;
+  }
+
+  // Cancel in PayHere if a subscription token/ID is present
+  const payhereSubId = order.payhere_subscription_id;
+  let payhereCancelStatus = "not_attempted";
+  if (payhereSubId) {
+    const success = await cancelPayhereSubscription(payhereSubId);
+    payhereCancelStatus = success ? "cancelled" : "failed_or_sandbox";
+  } else {
+    payhereCancelStatus = "no_subscription_id";
+  }
+
+  // Update local statuses
+  order.status = "CANCELLED";
+  await orderRepo.save(order);
+
+  const activeSub = await subscriptionRepo.findOneBy({ order_id: order.id });
+  if (activeSub) {
+    activeSub.status = "CANCELLED";
+    await subscriptionRepo.save(activeSub);
+  }
+
+  res.json({
+    success: true,
+    message: "Subscription cancelled successfully",
+    payhereCancelStatus,
   });
 }

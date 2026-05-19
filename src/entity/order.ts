@@ -13,6 +13,7 @@ type OrderType = {
   currency: string;
   payhere_subscription_id?: string | null;
   card_updated_at?: Date | null;
+  created_at?: Date;
 };
 
 const decimalTransformer = {
@@ -98,6 +99,10 @@ export const Order = new EntitySchema<OrderType>({
     card_updated_at: {
       type: "timestamp",
       nullable: true,
+    },
+    created_at: {
+      type: "timestamp",
+      createDate: true,
     },
   },
 });
