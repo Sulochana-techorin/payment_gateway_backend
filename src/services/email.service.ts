@@ -230,6 +230,40 @@ export async function sendPaymentFailedEmail(
   );
 }
 
+export async function sendRenewalSuccessEmail(
+  to: string,
+  customerName: string,
+  orderId: string,
+  amount: string,
+  currency: string,
+  newEndDate: string,
+) {
+  const text = [
+    `Dear ${customerName},`,
+    "",
+    "Your subscription has been renewed successfully.",
+    "",
+    "Renewal Details:",
+    `- Order ID: ${orderId}`,
+    `- Amount Charged: ${amount} ${currency}`,
+    `- Renewal Date: ${new Date().toISOString()}`,
+    `- Next Payment Due: ${newEndDate}`,
+    "",
+    "Your subscription will continue without interruption.",
+    "",
+    "If you have any questions, please contact our support team.",
+    "",
+    "Thank you,",
+    "Payment Subscription System",
+  ].join("\n");
+
+  return sendEmail(
+    to,
+    `✅ Subscription Renewed Successfully - Order ${orderId}`,
+    text,
+  );
+}
+
 export async function sendRefundSuccessEmail(
   to: string,
   customerName: string,

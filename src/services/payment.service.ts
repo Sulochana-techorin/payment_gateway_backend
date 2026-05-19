@@ -11,7 +11,7 @@ import { ApiError } from "../middleware/errorHandler";
 import { OrderRecord, SubscriptionRecord, UserRecord, ProcessedWebhookRecord } from "../types/models";
 import { updateOrderInvoicePathById, updateOrderStatusById } from "./order.service";
 import { createInvoiceFile } from "./invoice.service";
-import { sendPaymentSuccessEmail, sendCardUpdateEmail, sendPaymentFailedEmail, sendRefundSuccessEmail } from "./email.service";
+import { sendPaymentSuccessEmail, sendCardUpdateEmail, sendPaymentFailedEmail, sendRenewalSuccessEmail, sendRefundSuccessEmail } from "./email.service";
 
 type PayHereFields = {
   merchant_id: string;
@@ -659,8 +659,8 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
 
     // Only do invoice + subscription + email on a successful ACTIVE transition
     if (nextStatus !== "ACTIVE") {
-      // If a renewal charge failed (card declined, no funds, etc.), email the user
-      if (nextStatus === "FAILED" && wasAlreadyActive && chargeType === "RENEWAL") {
+      // If a payment failed (card declined, no funds, etc.), email the user
+      if (nextStatus === "FAILED") {
         const userRepo = AppDataSource.getRepository<UserRecord>(User);
         const user = await userRepo.findOneBy({ id: order.user_id });
         if (user) {
@@ -668,7 +668,9 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
             const frontendUrl = getEnv("FRONTEND_BASE_URL").replace(/\/+$/, "");
             const cardUpdateUrl = `${frontendUrl}/dashboard`;
             const currency = getEnv("CURRENCY");
-            const amount = Number(order.subscription_amount).toFixed(2);
+            const amount = chargeType === "RENEWAL"
+              ? Number(order.subscription_amount).toFixed(2)
+              : Number(order.total_amount).toFixed(2);
 
             await sendPaymentFailedEmail(
               user.email,
@@ -717,8 +719,9 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
     const invoicePath = await createInvoiceFile(invoiceData);
     await updateOrderInvoicePathById(updatedOrder.id, invoicePath);
 
-    // Send success email only on first activation (not on renewals or retries)
+    // Send appropriate email based on charge type
     if (!wasAlreadyActive && updatedOrder.status === "ACTIVE") {
+      // First-time activation: send full success email with invoice
       await trySendSuccessEmail(
         {
           ...invoiceData,
@@ -731,6 +734,31 @@ export async function processPayHereNotify(rawPayload: Record<string, unknown>) 
         payload.payment_id ?? null,
         invoicePath,
       );
+    } else if (chargeType === "RENEWAL" && updatedOrder.status === "ACTIVE") {
+      // Renewal success: send renewal confirmation email
+      const userRepo = AppDataSource.getRepository<UserRecord>(User);
+      const user = await userRepo.findOneBy({ id: order.user_id });
+      if (user) {
+        try {
+          const currency = getEnv("CURRENCY");
+          const amount = Number(order.subscription_amount).toFixed(2);
+          const subscriptionRepo = AppDataSource.getRepository<SubscriptionRecord>(Subscription);
+          const sub = await subscriptionRepo.findOneBy({ order_id: order.id });
+          const newEndDate = sub?.end_date ? new Date(sub.end_date).toISOString() : "N/A";
+
+          await sendRenewalSuccessEmail(
+            user.email,
+            user.name,
+            order.id,
+            amount,
+            currency,
+            newEndDate,
+          );
+          console.log("📧 Renewal success email sent to", user.email);
+        } catch (err) {
+          console.error("❌ Failed to send renewal success email:", err);
+        }
+      }
     }
 
     return {
