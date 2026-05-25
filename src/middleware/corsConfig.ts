@@ -8,7 +8,6 @@ export const corsConfig: CorsOptions = {
       callback(null, true);
       return;
     }
-    console.log(`CORS request from origin: ${origin}`);
 
     if (env.allowedOrigins.includes(origin)) {
       callback(null, true);
